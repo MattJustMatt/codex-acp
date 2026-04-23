@@ -58,3 +58,7 @@ unused = "warn"
 [patch.crates-io]
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }
+# Locally vendored to fix a cancel-unsafety bug in handle_io where BufReader
+# bytes could be discarded mid-message, producing spurious "failed to parse
+# incoming message: EOF while parsing a value ... Raw: \"\"" errors.
+agent-client-protocol = { path = "vendor/agent-client-protocol" }
