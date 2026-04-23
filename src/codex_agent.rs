@@ -12,10 +12,10 @@ use agent_client_protocol::{
 };
 use codex_config::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
-    NewThread, RolloutRecorder, ThreadManager, ThreadSortKey, config::Config,
+    NewThread, RolloutRecorder, SortDirection, ThreadManager, ThreadSortKey, config::Config,
     find_thread_path_by_id_str, parse_cursor,
 };
-use codex_exec_server::EnvironmentManager;
+use codex_exec_server::{EnvironmentManager, EnvironmentManagerArgs, ExecServerRuntimePaths};
 use codex_login::{
     AuthManager, CLIENT_ID, CODEX_API_KEY_ENV_VAR, CodexAuth, OPENAI_API_KEY_ENV_VAR,
     auth::{read_codex_api_key_from_env, read_openai_api_key_from_env},
@@ -61,12 +61,19 @@ const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
-    pub fn new(config: Config) -> Self {
+    pub fn new(
+        config: Config,
+        codex_self_exe: Option<PathBuf>,
+        codex_linux_sandbox_exe: Option<PathBuf>,
+    ) -> std::io::Result<Self> {
         let auth_manager = AuthManager::shared(
-            config.codex_home.clone(),
+            config.codex_home.clone().to_path_buf(),
             false,
             config.cli_auth_credentials_store_mode,
+            None,
         );
+        let runtime_paths =
+            ExecServerRuntimePaths::from_optional_paths(codex_self_exe, codex_linux_sandbox_exe)?;
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
@@ -78,17 +85,19 @@ impl CodexAgent {
                 // False for now
                 default_mode_request_user_input: false,
             },
-            Arc::new(EnvironmentManager::from_env()),
+            Arc::new(EnvironmentManager::new(EnvironmentManagerArgs::from_env(
+                runtime_paths,
+            ))),
             None,
         );
-        Self {
+        Ok(Self {
             auth_manager,
             client_capabilities,
             config,
             thread_manager,
             sessions: Rc::default(),
             session_roots,
-        }
+        })
     }
 
     fn session_id_from_thread_id(thread_id: ThreadId) -> SessionId {
@@ -148,9 +157,12 @@ impl CodexAgent {
                                 env_http_headers: None,
                             },
                             required: false,
+                            experimental_environment: None,
                             enabled: true,
+                            supports_parallel_tool_calls: false,
                             startup_timeout_sec: None,
                             tool_timeout_sec: None,
+                            default_tools_approval_mode: None,
                             disabled_tools: None,
                             enabled_tools: None,
                             disabled_reason: None,
@@ -184,9 +196,12 @@ impl CodexAgent {
                                 cwd: Some(cwd.to_path_buf()),
                             },
                             required: false,
+                            experimental_environment: None,
                             enabled: true,
+                            supports_parallel_tool_calls: false,
                             startup_timeout_sec: None,
                             tool_timeout_sec: None,
+                            default_tools_approval_mode: None,
                             disabled_tools: None,
                             enabled_tools: None,
                             disabled_reason: None,
@@ -273,7 +288,7 @@ impl Agent for CodexAgent {
             CodexAuthMethod::ChatGpt => {
                 // Perform browser/device login via codex-rs, then report success/failure to the client.
                 let opts = codex_login::ServerOptions::new(
-                    self.config.codex_home.clone(),
+                    self.config.codex_home.clone().to_path_buf(),
                     CLIENT_ID.to_string(),
                     None,
                     self.config.cli_auth_credentials_store_mode,
@@ -459,11 +474,13 @@ impl Agent for CodexAgent {
             SESSION_LIST_PAGE_SIZE,
             cursor_obj.as_ref(),
             ThreadSortKey::UpdatedAt,
+            SortDirection::Desc,
             &[
                 SessionSource::Cli,
                 SessionSource::VSCode,
                 SessionSource::Unknown,
             ],
+            None,
             None,
             self.config.model_provider_id.as_str(),
             None,

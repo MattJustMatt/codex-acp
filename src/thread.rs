@@ -36,6 +36,7 @@ use codex_protocol::{
     models::{PermissionProfile, ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
+    permissions::FileSystemAccessMode,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
@@ -840,19 +841,23 @@ impl PromptState {
                         "approved-for-session" => RequestPermissionsResponse {
                             permissions: permissions.into(),
                             scope: PermissionGrantScope::Session,
+                            strict_auto_review: false,
                         },
                         "approved" => RequestPermissionsResponse {
                             permissions: permissions.into(),
                             scope: PermissionGrantScope::Turn,
+                            strict_auto_review: false,
                         },
                         _ => RequestPermissionsResponse {
                             permissions: RequestPermissionProfile::default(),
                             scope: PermissionGrantScope::Turn,
+                            strict_auto_review: false,
                         },
                     },
                     RequestPermissionOutcome::Cancelled | _ => RequestPermissionsResponse {
                         permissions: RequestPermissionProfile::default(),
                         scope: PermissionGrantScope::Turn,
+                        strict_auto_review: false,
                     },
                 };
 
@@ -918,6 +923,9 @@ impl PromptState {
             | EventMsg::TurnStarted(..)
             | EventMsg::TurnComplete(..)
             | EventMsg::TurnDiff(..)
+            | EventMsg::GuardianWarning(..)
+            | EventMsg::ModelVerification(..)
+            | EventMsg::PatchApplyUpdated(..)
             | EventMsg::TurnAborted(..)
             | EventMsg::EnteredReviewMode(..)
             | EventMsg::ExitedReviewMode(..)
@@ -1078,7 +1086,7 @@ impl PromptState {
                 );
                 self.terminal_interaction(client, event).await;
             }
-            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, tool, arguments }) => {
+            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, tool, arguments, .. }) => {
                 info!("Dynamic tool call request: call_id={call_id}, turn_id={turn_id}, tool={tool}");
                 self.start_dynamic_tool_call(client, call_id, tool, arguments).await;
             }
@@ -1092,6 +1100,7 @@ impl PromptState {
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
                 call_id,
                 invocation,
+                ..
             }) => {
                 info!(
                     "MCP tool call begin: call_id={call_id}, invocation={} {}",
@@ -1104,6 +1113,7 @@ impl PromptState {
                 invocation,
                 duration,
                 result,
+                ..
             }) => {
                 info!(
                     "MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}",
@@ -1299,6 +1309,9 @@ impl PromptState {
             | EventMsg::HookCompleted(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
+            | EventMsg::GuardianWarning(..)
+            | EventMsg::ModelVerification(..)
+            | EventMsg::PatchApplyUpdated(..)
             // Revisit when we can emit status updates
             | EventMsg::BackgroundEvent(..)
             | EventMsg::SkillsUpdateAvailable
@@ -1585,6 +1598,7 @@ impl PromptState {
             success,
             error,
             duration: _,
+            ..
         } = event;
 
         client
@@ -2059,6 +2073,7 @@ impl PromptState {
             turn_id: _,
             reason,
             permissions,
+            ..
         } = event;
 
         // Create a new tool call for the command execution
@@ -2070,17 +2085,24 @@ impl PromptState {
             content.push(reason.clone());
         }
         if let Some(file_system) = permissions.file_system.as_ref() {
-            if let Some(read) = file_system.read.as_ref() {
-                content.push(format!(
-                    "File System Read Access: {}",
-                    read.iter().map(|p| p.display()).join(", ")
-                ));
+            let read = file_system
+                .explicit_path_entries()
+                .filter_map(|(path, access)| {
+                    (access == FileSystemAccessMode::Read).then(|| path.display())
+                })
+                .join(", ");
+            if !read.is_empty() {
+                content.push(format!("File System Read Access: {read}"));
             }
-            if let Some(write) = file_system.write.as_ref() {
-                content.push(format!(
-                    "File System Write Access: {}",
-                    write.iter().map(|p| p.display()).join(", ")
-                ));
+
+            let write = file_system
+                .explicit_path_entries()
+                .filter_map(|(path, access)| {
+                    (access == FileSystemAccessMode::Write).then(|| path.display())
+                })
+                .join(", ");
+            if !write.is_empty() {
+                content.push(format!("File System Write Access: {write}"));
             }
         }
         if let Some(network) = permissions.network.as_ref()
@@ -2160,7 +2182,8 @@ impl PromptState {
             }
             GuardianAssessmentStatus::Approved
             | GuardianAssessmentStatus::Denied
-            | GuardianAssessmentStatus::Aborted => {
+            | GuardianAssessmentStatus::Aborted
+            | GuardianAssessmentStatus::TimedOut => {
                 if self.active_guardian_assessments.remove(&event.id) {
                     client
                         .send_tool_call_update(ToolCallUpdate::new(
@@ -2296,6 +2319,15 @@ fn build_exec_permission_options(
                     PermissionOptionKind::RejectOnce,
                 ),
                 decision: ReviewDecision::Abort,
+            },
+            ReviewDecision::TimedOut => ExecPermissionOption {
+                option_id: "timed-out",
+                permission_option: PermissionOption::new(
+                    "timed-out",
+                    "Timed out",
+                    PermissionOptionKind::RejectOnce,
+                ),
+                decision: ReviewDecision::TimedOut,
             },
         })
         .collect()
@@ -2944,6 +2976,7 @@ impl<A: Auth> ThreadActor<A> {
                 cwd: None,
                 approval_policy: None,
                 sandbox_policy: None,
+                permission_profile: None,
                 model: Some(model_to_use.clone()),
                 effort: Some(effort_to_use),
                 summary: None,
@@ -2991,6 +3024,7 @@ impl<A: Auth> ThreadActor<A> {
                 cwd: None,
                 approval_policy: None,
                 sandbox_policy: None,
+                permission_profile: None,
                 model: None,
                 effort: Some(Some(effort)),
                 summary: None,
@@ -3066,6 +3100,7 @@ impl<A: Auth> ThreadActor<A> {
                             text: INIT_COMMAND_PROMPT.into(),
                             text_elements: vec![],
                         }],
+                        environments: None,
                         final_output_json_schema: None,
                         responsesapi_client_metadata: None,
                     }
@@ -3117,6 +3152,7 @@ impl<A: Auth> ThreadActor<A> {
                 _ => {
                     op = Op::UserInput {
                         items,
+                        environments: None,
                         final_output_json_schema: None,
                         responsesapi_client_metadata: None,
                     }
@@ -3125,6 +3161,7 @@ impl<A: Auth> ThreadActor<A> {
         } else {
             op = Op::UserInput {
                 items,
+                environments: None,
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
             }
@@ -3162,6 +3199,7 @@ impl<A: Auth> ThreadActor<A> {
                 cwd: None,
                 approval_policy: Some(preset.approval),
                 sandbox_policy: Some(preset.sandbox.clone()),
+                permission_profile: None,
                 model: None,
                 effort: None,
                 summary: None,
@@ -3229,6 +3267,7 @@ impl<A: Auth> ThreadActor<A> {
                 cwd: None,
                 approval_policy: None,
                 sandbox_policy: None,
+                permission_profile: None,
                 model: Some(model_to_use.clone()),
                 effort: Some(effort_to_use),
                 summary: None,
@@ -3767,9 +3806,9 @@ fn guardian_assessment_tool_call_status(status: &GuardianAssessmentStatus) -> To
     match status {
         GuardianAssessmentStatus::InProgress => ToolCallStatus::InProgress,
         GuardianAssessmentStatus::Approved => ToolCallStatus::Completed,
-        GuardianAssessmentStatus::Denied | GuardianAssessmentStatus::Aborted => {
-            ToolCallStatus::Failed
-        }
+        GuardianAssessmentStatus::Denied
+        | GuardianAssessmentStatus::Aborted
+        | GuardianAssessmentStatus::TimedOut => ToolCallStatus::Failed,
     }
 }
 
@@ -3781,6 +3820,7 @@ fn guardian_assessment_content(event: &GuardianAssessmentEvent) -> Vec<ToolCallC
             GuardianAssessmentStatus::Approved => "Approved",
             GuardianAssessmentStatus::Denied => "Denied",
             GuardianAssessmentStatus::Aborted => "Aborted",
+            GuardianAssessmentStatus::TimedOut => "Timed out",
         }
     )];
 
@@ -3850,6 +3890,9 @@ fn guardian_action_summary(action: &GuardianAssessmentAction) -> Option<String> 
             "MCP {tool_name} on {}",
             connector_name.as_deref().unwrap_or(server)
         )),
+        GuardianAssessmentAction::RequestPermissions { .. } => {
+            Some("request permissions".to_string())
+        }
     }
 }
 
@@ -4090,6 +4133,7 @@ mod tests {
                     text: INIT_COMMAND_PROMPT.to_string(),
                     text_elements: vec![]
                 }],
+                environments: None,
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
             }],
@@ -4365,6 +4409,7 @@ mod tests {
                     text: "/custom foo".into(),
                     text_elements: vec![]
                 }],
+                environments: None,
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
             }],
@@ -4531,7 +4576,7 @@ mod tests {
                             process_id: None,
                             turn_id: turn_id.clone(),
                             command: vec!["echo".into(), "a".into()],
-                            cwd: cwd.clone(),
+                            cwd: cwd.clone().try_into().unwrap(),
                             parsed_cmd: vec![ParsedCommand::Unknown {
                                 cmd: "echo a".into(),
                             }],
@@ -4543,7 +4588,7 @@ mod tests {
                             process_id: None,
                             turn_id: turn_id.clone(),
                             command: vec!["echo".into(), "b".into()],
-                            cwd: cwd.clone(),
+                            cwd: cwd.clone().try_into().unwrap(),
                             parsed_cmd: vec![ParsedCommand::Unknown {
                                 cmd: "echo b".into(),
                             }],
@@ -4555,7 +4600,7 @@ mod tests {
                             process_id: None,
                             turn_id: turn_id.clone(),
                             command: vec!["echo".into(), "a".into()],
-                            cwd: cwd.clone(),
+                            cwd: cwd.clone().try_into().unwrap(),
                             parsed_cmd: vec![],
                             source: Default::default(),
                             interaction_input: None,
@@ -4572,7 +4617,7 @@ mod tests {
                             process_id: None,
                             turn_id: turn_id.clone(),
                             command: vec!["echo".into(), "b".into()],
-                            cwd: cwd.clone(),
+                            cwd: cwd.clone().try_into().unwrap(),
                             parsed_cmd: vec![],
                             source: Default::default(),
                             interaction_input: None,
@@ -4589,6 +4634,7 @@ mod tests {
                             turn_id,
                             completed_at: None,
                             duration_ms: None,
+                            time_to_first_token_ms: None,
                         }));
                     } else if prompt == "approval-block" {
                         self.op_tx
@@ -4599,7 +4645,7 @@ mod tests {
                                     approval_id: Some("approval-id".to_string()),
                                     turn_id: id.to_string(),
                                     command: vec!["echo".to_string(), "hi".to_string()],
-                                    cwd: std::env::current_dir().unwrap(),
+                                    cwd: std::env::current_dir().unwrap().try_into().unwrap(),
                                     reason: None,
                                     network_approval_context: None,
                                     proposed_execpolicy_amendment: None,
@@ -4648,6 +4694,7 @@ mod tests {
                                     turn_id: id.to_string(),
                                     completed_at: None,
                                     duration_ms: None,
+                                    time_to_first_token_ms: None,
                                 }),
                             })
                             .unwrap();
@@ -4683,6 +4730,7 @@ mod tests {
                                 turn_id: id.to_string(),
                                 completed_at: None,
                                 duration_ms: None,
+                                time_to_first_token_ms: None,
                             }),
                         })
                         .unwrap();
@@ -4717,6 +4765,7 @@ mod tests {
                                 turn_id: id.to_string(),
                                 completed_at: None,
                                 duration_ms: None,
+                                time_to_first_token_ms: None,
                             }),
                         })
                         .unwrap();
@@ -4752,6 +4801,7 @@ mod tests {
                                 turn_id: id.to_string(),
                                 completed_at: None,
                                 duration_ms: None,
+                                time_to_first_token_ms: None,
                             }),
                         })
                         .unwrap();
@@ -4966,7 +5016,7 @@ mod tests {
                             approval_id: Some("approval-id".to_string()),
                             turn_id: "turn-id".to_string(),
                             command: vec!["echo".to_string(), "hi".to_string()],
-                            cwd: std::env::current_dir()?,
+                            cwd: std::env::current_dir()?.try_into()?,
                             reason: None,
                             network_approval_context: None,
                             proposed_execpolicy_amendment: None,
@@ -5234,7 +5284,7 @@ mod tests {
                             approval_id: Some("approval-id".to_string()),
                             turn_id: "turn-id".to_string(),
                             command: vec!["echo".to_string(), "hi".to_string()],
-                            cwd: std::env::current_dir()?,
+                            cwd: std::env::current_dir()?.try_into()?,
                             reason: None,
                             network_approval_context: None,
                             proposed_execpolicy_amendment: None,
